@@ -9,6 +9,7 @@ from aiogram.types import Message
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.client.session.aiohttp import AiohttpSession
 
 logging.basicConfig(level=logging.INFO)
 
@@ -183,16 +184,6 @@ async def on_text(msg: Message):
 # ── Запуск ────────────────────────────────────────────────────
 async def main():
     await init_db()
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
-    dp = Dispatcher()
-    dp.message.middleware(AuthMiddleware())
-    dp.include_router(router)
-    logging.info("✅ Bot started!")
-    await dp.start_polling(bot, allowed_updates=["message"])
-
-if __name__ == "__main__":
-    asyncio.run(main())
-# test update
+    
+    # Расширенный таймаут для Telegram API, чтобы избежать обрыва связи
+    session = Aiohttp

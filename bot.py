@@ -6,7 +6,7 @@ import asyncio, logging, os, aiosqlite
 from openai import AsyncOpenAI
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.types import Message
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -14,10 +14,11 @@ from aiogram.client.session.aiohttp import AiohttpSession
 logging.basicConfig(level=logging.INFO)
 
 # ── Настройки из переменных окружения ────────────────────────
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID  = int(os.environ["OWNER_USER_ID"])
-DS_KEY    = os.getenv("DEEPSEEK_API_KEY", "")
-OR_KEY    = os.getenv("OPENROUTER_API_KEY", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+OWNER_ID  = int(os.environ.get("OWNER_USER_ID", 0))
+DS_KEY    = os.getenv("DEEPSEEK_API_KEY", "").strip()
+OR_KEY    = os.getenv("OPENROUTER_API_KEY", "").strip()
+GEMINI_KEY= os.getenv("GEMINI_API_KEY", "").strip()
 DB_PATH   = "agent.db"
 
 OWNER_NAME    = os.getenv("OWNER_NAME", "")
@@ -29,8 +30,21 @@ OWNER_ACCOUNT = os.getenv("OWNER_ACCOUNT", "")
 OWNER_CORR    = os.getenv("OWNER_CORR_ACCOUNT", "")
 OWNER_PHONE   = os.getenv("OWNER_PHONE", "")
 
-# ── LLM: DeepSeek → OpenRouter free ──────────────────────────
+# ── LLM: Маршрутизация запросов ──────────────────────────────
 async def ask_llm(messages: list) -> str:
+    # 1. Сначала пробуем Gemini (самый стабильный вариант)
+    if GEMINI_KEY:
+        try:
+            client = AsyncOpenAI(api_key=GEMINI_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+            r = await client.chat.completions.create(
+                model="gemini-1.5-flash", messages=messages,
+                temperature=0.1, max_tokens=1500
+            )
+            return r.choices[0].message.content
+        except Exception as e:
+            logging.warning(f"Gemini Error: {e}")
+
+    # 2. Затем DeepSeek
     if DS_KEY:
         try:
             client = AsyncOpenAI(api_key=DS_KEY, base_url="https://api.deepseek.com/v1")
@@ -40,8 +54,9 @@ async def ask_llm(messages: list) -> str:
             )
             return r.choices[0].message.content
         except Exception as e:
-            logging.warning(f"DeepSeek: {e}")
+            logging.warning(f"DeepSeek Error: {e}")
 
+    # 3. Резервный OpenRouter
     if OR_KEY:
         try:
             client = AsyncOpenAI(api_key=OR_KEY, base_url="https://openrouter.ai/api/v1")
@@ -51,9 +66,9 @@ async def ask_llm(messages: list) -> str:
             )
             return r.choices[0].message.content
         except Exception as e:
-            logging.warning(f"OpenRouter: {e}")
+            logging.warning(f"OpenRouter Error: {e}")
 
-    return "❌ Нет доступных моделей. Проверь API ключи в настройках."
+    return "❌ Нет доступных моделей. Проверь API ключи в настройках или используй команду /ping"
 
 # ── База данных ───────────────────────────────────────────────
 async def init_db():
@@ -171,6 +186,49 @@ async def cmd_start(msg: Message):
         "Просто пиши!"
     )
 
+@router.message(Command("ping"))
+async def cmd_ping(msg: Message):
+    wait = await msg.answer("🔄 Проверяю API ключи. Это займет пару секунд...")
+    report = "📊 <b>Отчет по API:</b>\n\n"
+
+    # Тест Gemini
+    if GEMINI_KEY:
+        try:
+            c = AsyncOpenAI(api_key=GEMINI_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+            await c.chat.completions.create(model="gemini-1.5-flash", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
+            report += "🟢 Gemini: Работает отлично!\n"
+        except Exception as e:
+            report += f"🔴 Gemini: Ошибка ({e})\n"
+    else:
+        report += "⚪ Gemini: Ключ не задан\n"
+
+    # Тест DeepSeek
+    if DS_KEY:
+        try:
+            c = AsyncOpenAI(api_key=DS_KEY, base_url="https://api.deepseek.com/v1")
+            await c.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
+            report += "🟢 DeepSeek: Работает отлично!\n"
+        except Exception as e:
+            if "402" in str(e) or "Insufficient Balance" in str(e):
+                report += "🔴 DeepSeek: Кончились деньги на балансе (402)\n"
+            else:
+                report += f"🔴 DeepSeek: Ошибка ({e})\n"
+    else:
+        report += "⚪ DeepSeek: Ключ не задан\n"
+
+    # Тест OpenRouter
+    if OR_KEY:
+        try:
+            c = AsyncOpenAI(api_key=OR_KEY, base_url="https://openrouter.ai/api/v1")
+            await c.chat.completions.create(model="deepseek/deepseek-chat-v3-0324:free", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
+            report += "🟢 OpenRouter: Работает отлично!\n"
+        except Exception as e:
+            report += f"🔴 OpenRouter: Ошибка ({e})\n"
+    else:
+        report += "⚪ OpenRouter: Ключ не задан\n"
+
+    await wait.edit_text(report)
+
 @router.message(F.text)
 async def on_text(msg: Message):
     wait = await msg.answer("⏳")
@@ -210,6 +268,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
-    # Расширенный таймаут для Telegram API, чтобы избежать обрыва связи
-    session = Aiohttp

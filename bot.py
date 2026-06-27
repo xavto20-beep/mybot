@@ -183,7 +183,33 @@ async def on_text(msg: Message):
 
 # ── Запуск ────────────────────────────────────────────────────
 async def main():
+    logging.info("🚀 Шаг 1: Инициализация базы данных...")
     await init_db()
+    logging.info("✅ База данных успешно создана/загружена.")
+    
+    session = AiohttpSession(timeout=60)
+    
+    bot = Bot(
+        token=BOT_TOKEN,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher()
+    dp.message.middleware(AuthMiddleware())
+    dp.include_router(router)
+    
+    logging.info("🚀 Шаг 2: Попытка достучаться до серверов Telegram...")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logging.info("✅ Связь с Telegram успешно установлена!")
+    except Exception as e:
+        logging.error(f"❌ Ошибка связи с Telegram: {e}")
+        
+    logging.info("🚀 Шаг 3: Запуск приема сообщений (polling)...")
+    await dp.start_polling(bot, allowed_updates=["message"])
+
+if __name__ == "__main__":
+    asyncio.run(main())
     
     # Расширенный таймаут для Telegram API, чтобы избежать обрыва связи
     session = Aiohttp

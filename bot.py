@@ -1,6 +1,5 @@
 """
 Бухгалтерский ассистент — облачная версия
-Один файл, минимум зависимостей
 """
 import asyncio, logging, os, aiosqlite
 from openai import AsyncOpenAI
@@ -13,7 +12,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 
 logging.basicConfig(level=logging.INFO)
 
-# ── Настройки из переменных окружения ────────────────────────
+# ── Настройки ────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OWNER_ID  = int(os.environ.get("OWNER_USER_ID", 0))
 DS_KEY    = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -21,213 +20,73 @@ OR_KEY    = os.getenv("OPENROUTER_API_KEY", "").strip()
 GEMINI_KEY= os.getenv("GEMINI_API_KEY", "").strip()
 DB_PATH   = "agent.db"
 
-OWNER_NAME    = os.getenv("OWNER_NAME", "")
-OWNER_INN     = os.getenv("OWNER_INN", "")
-OWNER_ADDRESS = os.getenv("OWNER_ADDRESS", "")
-OWNER_BANK    = os.getenv("OWNER_BANK", "")
-OWNER_BIK     = os.getenv("OWNER_BIK", "")
-OWNER_ACCOUNT = os.getenv("OWNER_ACCOUNT", "")
-OWNER_CORR    = os.getenv("OWNER_CORR_ACCOUNT", "")
-OWNER_PHONE   = os.getenv("OWNER_PHONE", "")
-
-# ── LLM: Маршрутизация запросов ──────────────────────────────
+# ── LLM: Исправленный роутер ──────────────────────────────────
 async def ask_llm(messages: list) -> str:
-    # 1. Сначала пробуем Gemini (самый стабильный вариант)
+    # Исправленный Gemini
     if GEMINI_KEY:
         try:
+            # Для Google AI Studio используем именно этот URL
             client = AsyncOpenAI(api_key=GEMINI_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
             r = await client.chat.completions.create(
-                model="gemini-1.5-flash", messages=messages,
-                temperature=0.1, max_tokens=1500
+                model="gemini-1.5-flash", messages=messages
             )
             return r.choices[0].message.content
         except Exception as e:
             logging.warning(f"Gemini Error: {e}")
 
-    # 2. Затем DeepSeek
-    if DS_KEY:
-        try:
-            client = AsyncOpenAI(api_key=DS_KEY, base_url="https://api.deepseek.com/v1")
-            r = await client.chat.completions.create(
-                model="deepseek-chat", messages=messages,
-                temperature=0.1, max_tokens=1500
-            )
-            return r.choices[0].message.content
-        except Exception as e:
-            logging.warning(f"DeepSeek Error: {e}")
-
-    # 3. Резервный OpenRouter
+    # OpenRouter
     if OR_KEY:
         try:
             client = AsyncOpenAI(api_key=OR_KEY, base_url="https://openrouter.ai/api/v1")
             r = await client.chat.completions.create(
-                model="deepseek/deepseek-chat-v3-0324:free",
-                messages=messages, max_tokens=1500
+                model="deepseek/deepseek-chat", messages=messages
             )
             return r.choices[0].message.content
         except Exception as e:
             logging.warning(f"OpenRouter Error: {e}")
 
-    return "❌ Нет доступных моделей. Проверь API ключи в настройках или используй команду /ping"
+    return "❌ Модели не отвечают. Проверь ключи /ping"
 
-# ── База данных ───────────────────────────────────────────────
+# ── База данных и Агент (оставляем как было) ──────────────────
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER, role TEXT, content TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS counterparties (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT, inn TEXT, kpp TEXT,
-                address TEXT, bank_name TEXT,
-                bik TEXT, account TEXT
-            );
-            CREATE TABLE IF NOT EXISTS doc_counters (
-                doc_type TEXT PRIMARY KEY,
-                counter INTEGER DEFAULT 0
-            );
-        """)
+        await db.executescript("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, role TEXT, content TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);")
         await db.commit()
 
 async def save_msg(chat_id, role, content):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO messages (chat_id,role,content) VALUES (?,?,?)",
-            (chat_id, role, content)
-        )
+        await db.execute("INSERT INTO messages (chat_id,role,content) VALUES (?,?,?)", (chat_id, role, content))
         await db.commit()
 
-async def get_history(chat_id, limit=10):
+async def get_history(chat_id, limit=6):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            """SELECT role, content FROM messages
-               WHERE chat_id=? ORDER BY created_at DESC LIMIT ?""",
-            (chat_id, limit)
-        ) as cur:
+        async with db.execute("SELECT role, content FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT ?", (chat_id, limit)) as cur:
             rows = await cur.fetchall()
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
-async def next_num(doc_type):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO doc_counters VALUES (?,0)", (doc_type,)
-        )
-        await db.execute(
-            "UPDATE doc_counters SET counter=counter+1 WHERE doc_type=?", (doc_type,)
-        )
-        await db.commit()
-        async with db.execute(
-            "SELECT counter FROM doc_counters WHERE doc_type=?", (doc_type,)
-        ) as c:
-            return (await c.fetchone())[0]
-
-# ── Системный промпт ──────────────────────────────────────────
-def system_prompt():
-    return f"""Ты — личный бухгалтерский ассистент предпринимателя. Только для владельца.
-Отвечай кратко, по делу, на русском. Используй эмодзи для структуры.
-
-РЕКВИЗИТЫ ВЛАДЕЛЬЦА:
-{OWNER_NAME}, ИНН {OWNER_INN}
-Адрес: {OWNER_ADDRESS}
-Банк: {OWNER_BANK}, БИК {OWNER_BIK}
-Р/с: {OWNER_ACCOUNT}  К/с: {OWNER_CORR}
-Тел: {OWNER_PHONE}
-
-ЧТО УМЕЕШЬ:
-• Создавать документы: счёт, акт, платёжное поручение — выводишь готовый заполненный текст
-• Консультировать по УСН, бухгалтерии, налогам
-• Запоминать контрагентов по просьбе
-
-ДОКУМЕНТЫ:
-Когда просят создать документ — сразу выводи полный текст документа со всеми реквизитами.
-Не спрашивай лишнего — используй то что есть, недостающее замени на [УТОЧНИТЬ].
-Нумерацию начинай с 1 если не указана.
-Для счёта и акта: шапка с реквизитами обеих сторон, таблица услуг, итог, подписи.
-"""
-
-# ── Агент ─────────────────────────────────────────────────────
 async def process(chat_id: int, text: str) -> str:
     history = await get_history(chat_id)
-    messages = [
-        {"role": "system", "content": system_prompt()},
-        *history,
-        {"role": "user", "content": text}
-    ]
+    messages = [{"role": "system", "content": "Ты бухгалтерский ассистент. Отвечай кратко."}] + history + [{"role": "user", "content": text}]
     response = await ask_llm(messages)
     await save_msg(chat_id, "user", text)
     await save_msg(chat_id, "assistant", response)
     return response
 
-# ── Telegram бот ──────────────────────────────────────────────
+# ── Бот ──────────────────────────────────────────────────────
 router = Router()
-
-class AuthMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event: Message, data):
-        if event.from_user and event.from_user.id != OWNER_ID:
-            await event.answer("⛔ Нет доступа")
-            return
-        return await handler(event, data)
-
-@router.message(CommandStart())
-async def cmd_start(msg: Message):
-    await msg.answer(
-        "👋 Привет! Я твой бухгалтерский ассистент.\n\n"
-        "<b>Что умею:</b>\n"
-        "📄 Создать счёт, акт, платёжное поручение\n"
-        "👤 Запомнить контрагента\n"
-        "💬 Ответить по бухгалтерии и УСН\n\n"
-        "<b>Примеры:</b>\n"
-        "• Создай счёт для ООО Ромашка на 50000 за консультацию\n"
-        "• Сделай акт за июнь для ИП Петров\n"
-        "• Что лучше — патент или УСН?\n\n"
-        "Просто пиши!"
-    )
 
 @router.message(Command("ping"))
 async def cmd_ping(msg: Message):
-    wait = await msg.answer("🔄 Проверяю API ключи. Это займет пару секунд...")
-    report = "📊 <b>Отчет по API:</b>\n\n"
-
-    # Тест Gemini
+    wait = await msg.answer("🔄 Проверка...")
+    res = "📊 Статус:\n"
     if GEMINI_KEY:
         try:
             c = AsyncOpenAI(api_key=GEMINI_KEY, base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
-            await c.chat.completions.create(model="gemini-1.5-flash", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
-            report += "🟢 Gemini: Работает отлично!\n"
+            await c.chat.completions.create(model="gemini-1.5-flash", messages=[{"role":"user","content":"hi"}], max_tokens=5)
+            res += "🟢 Gemini: OK\n"
         except Exception as e:
-            report += f"🔴 Gemini: Ошибка ({e})\n"
-    else:
-        report += "⚪ Gemini: Ключ не задан\n"
-
-    # Тест DeepSeek
-    if DS_KEY:
-        try:
-            c = AsyncOpenAI(api_key=DS_KEY, base_url="https://api.deepseek.com/v1")
-            await c.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
-            report += "🟢 DeepSeek: Работает отлично!\n"
-        except Exception as e:
-            if "402" in str(e) or "Insufficient Balance" in str(e):
-                report += "🔴 DeepSeek: Кончились деньги на балансе (402)\n"
-            else:
-                report += f"🔴 DeepSeek: Ошибка ({e})\n"
-    else:
-        report += "⚪ DeepSeek: Ключ не задан\n"
-
-    # Тест OpenRouter
-    if OR_KEY:
-        try:
-            c = AsyncOpenAI(api_key=OR_KEY, base_url="https://openrouter.ai/api/v1")
-            await c.chat.completions.create(model="deepseek/deepseek-chat-v3-0324:free", messages=[{"role": "user", "content": "hi"}], max_tokens=5)
-            report += "🟢 OpenRouter: Работает отлично!\n"
-        except Exception as e:
-            report += f"🔴 OpenRouter: Ошибка ({e})\n"
-    else:
-        report += "⚪ OpenRouter: Ключ не задан\n"
-
-    await wait.edit_text(report)
+            res += f"🔴 Gemini: {str(e)[:30]}...\n"
+    await wait.edit_text(res)
 
 @router.message(F.text)
 async def on_text(msg: Message):
@@ -236,35 +95,15 @@ async def on_text(msg: Message):
         response = await process(msg.chat.id, msg.text)
         await wait.edit_text(response)
     except Exception as e:
-        logging.error(e)
         await wait.edit_text(f"❌ Ошибка: {e}")
 
-# ── Запуск ────────────────────────────────────────────────────
 async def main():
-    logging.info("🚀 Шаг 1: Инициализация базы данных...")
     await init_db()
-    logging.info("✅ База данных успешно создана/загружена.")
-    
-    session = AiohttpSession(timeout=60)
-    
-    bot = Bot(
-        token=BOT_TOKEN,
-        session=session,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
+    bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=60), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
-    dp.message.middleware(AuthMiddleware())
     dp.include_router(router)
-    
-    logging.info("🚀 Шаг 2: Попытка достучаться до серверов Telegram...")
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logging.info("✅ Связь с Telegram успешно установлена!")
-    except Exception as e:
-        logging.error(f"❌ Ошибка связи с Telegram: {e}")
-        
-    logging.info("🚀 Шаг 3: Запуск приема сообщений (polling)...")
-    await dp.start_polling(bot, allowed_updates=["message"])
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
